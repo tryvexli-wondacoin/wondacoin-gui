@@ -24,7 +24,7 @@ import {
   UserCircle2,
 } from "lucide-react";
 
-const API_BASE = "https://wondacoin-backend.onrender.com/";
+const API_BASE = "https://wondacoin-backend.onrender.com";
 const TOKEN_KEY = "wondacoin_admin_token";
 const AUTO_REFRESH_MS = 10000;
 
@@ -77,7 +77,7 @@ function isWithinDateRange(value: string, start: string, end: string) {
 }
 
 export default function Page() {
-  const [token, setToken] = useState<string>("");
+  const [token, setToken] = useState("");
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("admin123");
   const [loading, setLoading] = useState(false);
@@ -111,10 +111,8 @@ export default function Page() {
   const [auditPageSize, setAuditPageSize] = useState(10);
 
   useEffect(() => {
-    const saved = localStorage.getItem(TOKEN_KEY);
-    if (saved) {
-      setToken(saved);
-    }
+    const saved = window.localStorage.getItem(TOKEN_KEY);
+    if (saved) setToken(saved);
   }, []);
 
   useEffect(() => {
@@ -122,11 +120,11 @@ export default function Page() {
 
     loadDashboard();
 
-    const interval = setInterval(() => {
+    const interval = window.setInterval(() => {
       loadDashboard();
     }, AUTO_REFRESH_MS);
 
-    return () => clearInterval(interval);
+    return () => window.clearInterval(interval);
   }, [token]);
 
   useEffect(() => {
@@ -140,6 +138,20 @@ export default function Page() {
     auditPageSize,
   ]);
 
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil(filteredAuditLogs.length / auditPageSize));
+    if (auditPage > totalPages) setAuditPage(totalPages);
+  }, [auditPage, auditPageSize, filteredAuditLogs.length]);
+
+  async function safeJsonResponse(res: Response) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(text?.slice(0, 200) || "Invalid server response");
+    }
+  }
+
   async function apiFetch(path: string, options: RequestInit = {}) {
     const res = await fetch(`${API_BASE}${path}`, {
       ...options,
@@ -150,7 +162,32 @@ export default function Page() {
       },
     });
 
-    return res.json();
+    const data = await safeJsonResponse(res);
+
+    if (!res.ok || data?.success === false) {
+      throw new Error(data?.message || "Request failed");
+    }
+
+    return data;
+  }
+
+  async function loadDashboard() {
+    try {
+      setLoading(true);
+      setMessage("");
+
+      const [statsData, auditData] = await Promise.all([
+        apiFetch("/admin-stats"),
+        apiFetch("/audit-logs").catch(() => ({ audit_logs: [] })),
+      ]);
+
+      setStats(statsData?.stats || statsData || null);
+      setAuditLogs(auditData?.audit_logs || []);
+    } catch (error: any) {
+      setMessage(error?.message || "Failed to load dashboard");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function login() {
@@ -158,7 +195,7 @@ export default function Page() {
       setLoading(true);
       setMessage("");
 
-      const res = await fetch(`${API_BASE}/admin-login`, {
+      const res = await fetch(`${API_BASE}/login`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -166,39 +203,27 @@ export default function Page() {
         body: JSON.stringify({ username, password }),
       });
 
-      const data = await res.json();
+      const raw = await res.text();
+      const contentType = res.headers.get("content-type") || "";
 
-      if (data.success && data.token) {
-        localStorage.setItem(TOKEN_KEY, data.token);
-        setToken(data.token);
-        setMessage("Login successful");
-      } else {
-        setMessage(data.message || "Login failed");
-      }
-    } catch (err: any) {
-      setMessage(err?.message || "Login failed");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function loadDashboard() {
-    try {
-      setLoading(true);
-      const [statsData, auditData] = await Promise.all([
-        apiFetch("/stats"),
-        apiFetch("/audit-logs"),
-      ]);
-
-      if (statsData.success) {
-        setStats(statsData.stats);
+      if (!contentType.includes("application/json")) {
+        setMessage(`Non-JSON response: ${raw.slice(0, 120)}`);
+        return;
       }
 
-      if (auditData.success) {
-        setAuditLogs(auditData.audit_logs || []);
+      const data = JSON.parse(raw);
+
+      if (!res.ok || !data?.success) {
+        setMessage(data?.message || "Login failed");
+        return;
       }
-    } catch (err: any) {
-      setMessage(err?.message || "Failed to load dashboard");
+
+      const nextToken = data?.token || "";
+      localStorage.setItem(TOKEN_KEY, nextToken);
+      setToken(nextToken);
+      setMessage("Login successful");
+    } catch (error: any) {
+      setMessage(error?.message || "Login failed");
     } finally {
       setLoading(false);
     }
@@ -207,15 +232,18 @@ export default function Page() {
   async function runAction(path: string) {
     try {
       setLoading(true);
+      setMessage("");
+
       const data = await apiFetch(path);
       setLastAction(data);
-      setMessage(data.message || "Action completed");
-
-      if (data.success) {
-        await loadDashboard();
-      }
-    } catch (err: any) {
-      setMessage(err?.message || "Action failed");
+      setMessage(data?.message || "Action completed");
+      await loadDashboard();
+    } catch (error: any) {
+      setLastAction({
+        success: false,
+        message: error?.message || "Action failed",
+      });
+      setMessage(error?.message || "Action failed");
     } finally {
       setLoading(false);
     }
@@ -224,16 +252,22 @@ export default function Page() {
   async function runBalanceLookup() {
     try {
       setLoading(true);
-      const data = await apiFetch(`/wallet-balance?user_id=${balanceLookup.user_id}`);
+      setMessage("");
+
+      const data = await apiFetch(
+        `/wallet-balance?user_id=${encodeURIComponent(balanceLookup.user_id)}`
+      );
       setBalanceResult(data);
       setLastAction(data);
-      setMessage(data.message || "Balance lookup complete");
-
-      if (data.success) {
-        await loadDashboard();
-      }
-    } catch (err: any) {
-      setMessage(err?.message || "Balance lookup failed");
+      setMessage(data?.message || "Balance lookup complete");
+    } catch (error: any) {
+      const failure = {
+        success: false,
+        message: error?.message || "Balance lookup failed",
+      };
+      setBalanceResult(failure);
+      setLastAction(failure);
+      setMessage(failure.message);
     } finally {
       setLoading(false);
     }
@@ -250,15 +284,13 @@ export default function Page() {
   }
 
   const auditActionOptions = useMemo(() => {
-    const unique = Array.from(
+    return Array.from(
       new Set(
         auditLogs
           .map((row) => String(row.action ?? "").trim())
           .filter(Boolean)
       )
     ).sort();
-
-    return unique;
   }, [auditLogs]);
 
   const filteredAuditLogs = useMemo(() => {
@@ -290,10 +322,7 @@ export default function Page() {
         auditActionFilter === "all" ||
         String(row.action ?? "") === auditActionFilter;
 
-      const userHaystack = [
-        row.target_id,
-        row.details,
-      ]
+      const userHaystack = [row.target_id, row.details]
         .map((v) => String(v ?? "").toLowerCase())
         .join(" ");
 
@@ -301,7 +330,6 @@ export default function Page() {
         !uf ||
         userHaystack.includes(uf) ||
         userHaystack.includes(`user ${uf}`) ||
-        userHaystack.includes(`user ${uf} `) ||
         userHaystack.includes(`${uf}->`) ||
         userHaystack.includes(`->${uf}`);
 
@@ -316,27 +344,31 @@ export default function Page() {
     auditUserFilter,
   ]);
 
-  const totalAuditPages = Math.max(1, Math.ceil(filteredAuditLogs.length / auditPageSize));
-
-  const paginatedAuditLogs = useMemo(() => {
-    const start = (auditPage - 1) * auditPageSize;
-    const end = start + auditPageSize;
-    return filteredAuditLogs.slice(start, end);
-  }, [filteredAuditLogs, auditPage, auditPageSize]);
+  const totalAuditPages = Math.max(
+    1,
+    Math.ceil(filteredAuditLogs.length / auditPageSize)
+  );
 
   const safeAuditPage = Math.min(auditPage, totalAuditPages);
 
-  useEffect(() => {
-    if (auditPage > totalAuditPages) {
-      setAuditPage(totalAuditPages);
-    }
-  }, [auditPage, totalAuditPages]);
+  const paginatedAuditLogs = useMemo(() => {
+    const start = (safeAuditPage - 1) * auditPageSize;
+    const end = start + auditPageSize;
+    return filteredAuditLogs.slice(start, end);
+  }, [filteredAuditLogs, safeAuditPage, auditPageSize]);
 
   if (!token) {
     return (
       <div style={pageStyle}>
         <div style={loginCardStyle}>
-          <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 18 }}>
+          <div
+            style={{
+              display: "flex",
+              gap: 14,
+              alignItems: "center",
+              marginBottom: 18,
+            }}
+          >
             <div style={iconWrapStyle}>
               <Lock size={26} />
             </div>
@@ -364,7 +396,7 @@ export default function Page() {
             />
 
             <button style={buttonStyle} onClick={login} disabled={loading}>
-              Log In
+              {loading ? "Logging in..." : "Log In"}
             </button>
 
             {message && (
@@ -382,14 +414,20 @@ export default function Page() {
   return (
     <div style={pageStyle}>
       <div style={{ maxWidth: 1400, margin: "0 auto", display: "grid", gap: 24 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1.3fr 0.7fr", gap: 16 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1.3fr 0.7fr",
+            gap: 16,
+          }}
+        >
           <div style={cardStyle}>
             <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
               <div style={iconWrapStyle}>
                 <Wallet size={26} />
               </div>
               <div>
-                <h1 style={{ margin: 0, fontSize: 28 }}>Wondacoin Protected Admin</h1>
+                <h1 style={{ margin: 0, fontSize: 28 }}>Wondacoin Admin Dashboard</h1>
                 <p style={{ margin: "6px 0 0", color: "#64748b" }}>
                   Protected dashboard with searchable audit logging
                 </p>
@@ -417,14 +455,27 @@ export default function Page() {
 
         {message && (
           <div style={cardStyle}>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", color: "#065f46" }}>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+                color: "#065f46",
+              }}
+            >
               <CheckCircle2 size={18} />
               <span>{message}</span>
             </div>
           </div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(4, 1fr)",
+            gap: 16,
+          }}
+        >
           <StatCard icon={<Users size={18} />} title="Total Users" value={stats?.total_users ?? "-"} />
           <StatCard icon={<CreditCard size={18} />} title="Total Wallets" value={stats?.total_wallets ?? "-"} />
           <StatCard icon={<Receipt size={18} />} title="Transactions" value={stats?.total_transactions ?? "-"} />
@@ -558,7 +609,11 @@ export default function Page() {
                     onChange={(e) => setBalanceLookup({ user_id: e.target.value })}
                     style={inputStyle}
                   />
-                  <button style={{ ...buttonStyle, marginTop: 0, width: 220 }} onClick={runBalanceLookup}>
+                  <button
+                    style={{ ...buttonStyle, marginTop: 0, width: 220 }}
+                    onClick={runBalanceLookup}
+                    disabled={loading}
+                  >
                     Get Balance
                   </button>
                 </div>
@@ -569,6 +624,7 @@ export default function Page() {
           <div style={cardStyle}>
             <h2 style={{ marginTop: 0 }}>Last Action</h2>
             <ResponseBox data={lastAction} empty="No action run yet." />
+
             <div style={{ marginTop: 18 }}>
               <h2 style={{ marginTop: 0 }}>Balance Lookup Result</h2>
               <ResponseBox data={balanceResult} empty="No balance lookup yet." />
@@ -577,7 +633,15 @@ export default function Page() {
         </div>
 
         <div style={cardStyle}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 16 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              alignItems: "center",
+              marginBottom: 16,
+            }}
+          >
             <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
               <ScrollText size={20} />
               <h2 style={{ margin: 0 }}>Audit Log</h2>
@@ -585,11 +649,15 @@ export default function Page() {
 
             <button
               onClick={() =>
-                downloadCsv(
-                  "wondacoin_audit_logs.csv",
-                  filteredAuditLogs,
-                  ["id", "admin_user", "action", "target_type", "target_id", "details", "created_at"]
-                )
+                downloadCsv("wondacoin_audit_logs.csv", filteredAuditLogs, [
+                  "id",
+                  "admin_user",
+                  "action",
+                  "target_type",
+                  "target_id",
+                  "details",
+                  "created_at",
+                ])
               }
               style={smallButtonStyle}
             >
@@ -689,7 +757,8 @@ export default function Page() {
             }}
           >
             <div style={{ color: "#475569", fontSize: 14 }}>
-              Showing {paginatedAuditLogs.length} of {filteredAuditLogs.length} audit record(s)
+              Showing {paginatedAuditLogs.length} of {filteredAuditLogs.length} audit
+              record(s)
             </div>
 
             <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
@@ -736,22 +805,24 @@ export default function Page() {
                 Prev
               </button>
 
-              {Array.from({ length: totalAuditPages }).slice(0, 7).map((_, idx) => {
-                const pageNum = idx + 1;
-                return (
-                  <button
-                    key={pageNum}
-                    onClick={() => setAuditPage(pageNum)}
-                    style={{
-                      ...pageNumberStyle,
-                      background: safeAuditPage === pageNum ? "#111827" : "white",
-                      color: safeAuditPage === pageNum ? "white" : "#111827",
-                    }}
-                  >
-                    {pageNum}
-                  </button>
-                );
-              })}
+              {Array.from({ length: totalAuditPages })
+                .slice(0, 7)
+                .map((_, idx) => {
+                  const pageNum = idx + 1;
+                  return (
+                    <button
+                      key={pageNum}
+                      onClick={() => setAuditPage(pageNum)}
+                      style={{
+                        ...pageNumberStyle,
+                        background: safeAuditPage === pageNum ? "#111827" : "white",
+                        color: safeAuditPage === pageNum ? "white" : "#111827",
+                      }}
+                    >
+                      {pageNum}
+                    </button>
+                  );
+                })}
 
               {totalAuditPages > 7 && (
                 <span style={{ color: "#64748b", padding: "0 6px" }}>...</span>
@@ -792,11 +863,25 @@ function AuditTable({ rows }: { rows: any[] }) {
   }
 
   return (
-    <div style={{ overflowX: "auto", border: "1px solid #e2e8f0", borderRadius: 18 }}>
+    <div
+      style={{
+        overflowX: "auto",
+        border: "1px solid #e2e8f0",
+        borderRadius: 18,
+      }}
+    >
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
         <thead>
           <tr style={{ background: "#f8fafc" }}>
-            {["id", "admin_user", "action", "target_type", "target_id", "details", "created_at"].map((col) => (
+            {[
+              "id",
+              "admin_user",
+              "action",
+              "target_type",
+              "target_id",
+              "details",
+              "created_at",
+            ].map((col) => (
               <th
                 key={col}
                 style={{
@@ -814,7 +899,15 @@ function AuditTable({ rows }: { rows: any[] }) {
         <tbody>
           {rows.map((row, idx) => (
             <tr key={idx}>
-              {["id", "admin_user", "action", "target_type", "target_id", "details", "created_at"].map((col) => (
+              {[
+                "id",
+                "admin_user",
+                "action",
+                "target_type",
+                "target_id",
+                "details",
+                "created_at",
+              ].map((col) => (
                 <td
                   key={col}
                   style={{
@@ -866,7 +959,14 @@ function StatCard({
 }) {
   return (
     <div style={cardStyle}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 10,
+        }}
+      >
         <div style={{ color: "#475569", fontSize: 14 }}>{title}</div>
         <div style={{ color: "#0f172a" }}>{icon}</div>
       </div>
